@@ -13,14 +13,19 @@ CUMULUS = {
     'USE_SSL': False,
     'USERNAME': None,
     'STATIC_CONTAINER': None,
-    'FILTER_LIST': []
+    'FILTER_LIST': [],
+    'USE_SWIFT_BACKEND' : False,
+    'SWIFT_PREFIX' : 'AUTH_',
+    'SWIFT_VERSION' : 'v1'
+
 }
 
 if hasattr(settings, 'CUMULUS'):
     CUMULUS.update(settings.CUMULUS)
 
 # set auth_url to the actual URL string in the cloudfiles module
-CUMULUS['AUTH_URL'] = getattr(cloudfiles, CUMULUS['AUTH_URL'])
+if CUMULUS['USE_SWIFT_BACKEND'] == False:
+    CUMULUS['AUTH_URL'] = getattr(cloudfiles, CUMULUS['AUTH_URL'])
 
 # backwards compatibility for old-style cumulus settings
 if not hasattr(settings, 'CUMULUS'):

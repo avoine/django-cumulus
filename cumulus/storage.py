@@ -8,6 +8,18 @@ from django.core.files.storage import Storage
 from .settings import CUMULUS
 
 
+class SwiftAuthentication(object):
+    """Auth container to pass CloudFiles storage URL and token from
+       session.
+    """
+    def __init__(self, storage_url, auth_token):
+        self.storage_url = storage_url
+        self.auth_token = auth_token
+
+    def authenticate(self):
+        return (self.storage_url, '', self.auth_token)
+
+
 class CloudFilesStorage(Storage):
     """
     Custom storage for Rackspace Cloud Files.
@@ -27,6 +39,18 @@ class CloudFilesStorage(Storage):
         self.use_servicenet = CUMULUS['SERVICENET']
         self.username = username or CUMULUS['USERNAME']
         self.use_ssl = CUMULUS['USE_SSL']
+        self.use_swift_backend = CUMULUS['USE_SWIFT_BACKEND']
+        self.swift_prefix = CUMULUS['SWIFT_PREFIX']
+        self.swift_version = CUMULUS['SWIFT_VERSION']
+
+        self.auth = None
+        if self.use_swift_backend:
+            self.swift_url = '/'.join([self.auth_url,
+                                  self.swift_version,
+                                  self.swift_prefix + self.username,
+                                  ''])
+
+            self.auth = SwiftAuthentication(self.swift_url, self.api_key)
 
 
     def __getstate__(self):
@@ -46,6 +70,7 @@ class CloudFilesStorage(Storage):
                                   username=self.username,
                                   api_key=self.api_key,
                                   authurl = self.auth_url,
+                                  auth = self.auth,
                                   timeout=self.timeout,
                                   servicenet=self.use_servicenet,
                                   **self.connection_kwargs)
@@ -66,23 +91,31 @@ class CloudFilesStorage(Storage):
         """
         Set the container, making it publicly available if it is not already.
         """
-        if not container.is_public():
-            container.make_public()
-        if hasattr(self, '_container_public_uri'):
-            delattr(self, '_container_public_uri')
-        self._container = container
+        try:
+            if not container.is_public():
+                container.make_public()
+            if hasattr(self, '_container_public_uri'):
+                delattr(self, '_container_public_uri')
+        except cloudfiles.errors.CDNNotEnabled:
+            return # swift don't implements those methods yet.
+        finally:
+            self._container = container
 
     container = property(_get_container, _set_container)
 
     def _get_container_url(self):
-        if not hasattr(self, '_container_public_uri'):
-            if self.use_ssl:
-                self._container_public_uri = self.container.public_ssl_uri()
-            else:
-                self._container_public_uri = self.container.public_uri()
-        if CUMULUS['CNAMES'] and self._container_public_uri in CUMULUS['CNAMES']:
-            self._container_public_uri = CUMULUS['CNAMES'][self._container_public_uri]
-        return self._container_public_uri
+        try:
+            if not hasattr(self, '_container_public_uri'):
+                if self.use_ssl:
+                    self._container_public_uri = self.container.public_ssl_uri()
+                else:
+                    self._container_public_uri = self.container.public_uri()
+            if CUMULUS['CNAMES'] and self._container_public_uri in CUMULUS['CNAMES']:
+                self._container_public_uri = CUMULUS['CNAMES'][self._container_public_uri]
+            return self._container_public_uri
+        except cloudfiles.errors.CDNNotEnabled:
+            # swift don't implements those methods yet
+            return self.swift_url + self.container_name 
 
     container_url = property(_get_container_url)
 
