@@ -1,4 +1,5 @@
 import cloudfiles
+from cloudfiles.consts import default_cdn_ttl
 
 from django.conf import settings
 
