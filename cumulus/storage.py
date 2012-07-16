@@ -1,23 +1,61 @@
-import cloudfiles
+import logging
 import mimetypes
+import os
+import re
+from httplib import HTTPException
+from ssl import SSLError
+from gzip import GzipFile
+from StringIO import StringIO
+
+import cloudfiles
 from cloudfiles.errors import NoSuchObject, ResponseError
 
-from django.core.files import File
+from django.conf import settings
+from django.core.files.base import File, ContentFile
 from django.core.files.storage import Storage
 
 from .settings import CUMULUS
 
+logger = logging.getLogger(__name__)
 
-class SwiftAuthentication(object):
-    """Auth container to pass CloudFiles storage URL and token from
-       session.
+HEADER_PATTERNS = tuple((re.compile(p), h) for p, h in CUMULUS.get('HEADERS', {}))
+
+
+def sync_headers(cloud_obj, headers={}, header_patterns=HEADER_PATTERNS):
     """
-    def __init__(self, storage_url, auth_token):
-        self.storage_url = storage_url
-        self.auth_token = auth_token
+    Overwrite the given cloud_obj's headers with the ones given as ``headers`
+    and add additional headers as defined in the HEADERS setting depending on 
+    the cloud_obj's file name.
+    """
+    if not hasattr(cloud_obj, 'headers'):
+        if HEADER_PATTERNS:
+            print('Warning: will skip syncing headers. Please use latest '
+                  ' version of python-cloudfiles.')
+        return
+    # don't set headers on directories
+    content_type = getattr(cloud_obj, 'content_type', None)
+    if content_type == 'application/directory':
+        return
+    matched_headers = {}
+    for pattern, pattern_headers in header_patterns:
+        if pattern.match(cloud_obj.name):
+            matched_headers.update(pattern_headers.copy())
+    matched_headers.update(cloud_obj.headers)  # preserve headers already set
+    matched_headers.update(headers)  # explicitly set headers overwrite matches and already set headers
+    if matched_headers != cloud_obj.headers:
+        cloud_obj.headers = matched_headers
+        cloud_obj.sync_metadata()
 
-    def authenticate(self):
-        return (self.storage_url, '', self.auth_token)
+
+def get_gzipped_contents(input_file):
+    """
+    Return a gzipped version of a previously opened file's buffer.
+    """
+    zbuf = StringIO()
+    zfile = GzipFile(mode='wb', compresslevel=6, fileobj=zbuf)
+    zfile.write(input_file.read())
+    zfile.close()
+    return ContentFile(zbuf.getvalue())
 
 
 class CloudFilesStorage(Storage):
@@ -27,31 +65,20 @@ class CloudFilesStorage(Storage):
     default_quick_listdir = True
 
     def __init__(self, username=None, api_key=None, container=None, timeout=None,
-                 connection_kwargs=None):
+                 max_retries=None, connection_kwargs=None):
         """
         Initialize the settings for the connection and container.
         """
         self.api_key = api_key or CUMULUS['API_KEY']
         self.auth_url = CUMULUS['AUTH_URL']
-        self.connection_kwargs = connection_kwargs or {}
+        self.connection_kwargs = connection_kwargs or CUMULUS['CONNECTION_ARGS']
         self.container_name = container or CUMULUS['CONTAINER']
         self.timeout = timeout or CUMULUS['TIMEOUT']
+        self.max_retries = max_retries or CUMULUS['MAX_RETRIES']
         self.use_servicenet = CUMULUS['SERVICENET']
         self.username = username or CUMULUS['USERNAME']
+        self.ttl = CUMULUS['TTL']
         self.use_ssl = CUMULUS['USE_SSL']
-        self.use_swift_backend = CUMULUS['USE_SWIFT_BACKEND']
-        self.swift_prefix = CUMULUS['SWIFT_PREFIX']
-        self.swift_version = CUMULUS['SWIFT_VERSION']
-
-        self.auth = None
-        if self.use_swift_backend:
-            self.swift_url = '/'.join([self.auth_url,
-                                  self.swift_version,
-                                  self.swift_prefix + self.username,
-                                  ''])
-
-            self.auth = SwiftAuthentication(self.swift_url, self.api_key)
-
 
     def __getstate__(self):
         """
@@ -69,8 +96,7 @@ class CloudFilesStorage(Storage):
             self._connection = cloudfiles.get_connection(
                                   username=self.username,
                                   api_key=self.api_key,
-                                  authurl = self.auth_url,
-                                  auth = self.auth,
+                                  authurl=self.auth_url,
                                   timeout=self.timeout,
                                   servicenet=self.use_servicenet,
                                   **self.connection_kwargs)
@@ -89,46 +115,47 @@ class CloudFilesStorage(Storage):
 
     def _set_container(self, container):
         """
-        Set the container, making it publicly available if it is not already.
+        Set the container (and, if needed, the configured TTL on it), making
+        the container publicly available.
         """
-        try:
-            if not container.is_public():
-                container.make_public()
-            if hasattr(self, '_container_public_uri'):
-                delattr(self, '_container_public_uri')
-        except cloudfiles.errors.CDNNotEnabled:
-            return # swift don't implements those methods yet.
-        finally:
-            self._container = container
+        self._container = container
 
     container = property(_get_container, _set_container)
 
     def _get_container_url(self):
-        try:
-            if not hasattr(self, '_container_public_uri'):
-                if self.use_ssl:
-                    self._container_public_uri = self.container.public_ssl_uri()
-                else:
-                    self._container_public_uri = self.container.public_uri()
-            if CUMULUS['CNAMES'] and self._container_public_uri in CUMULUS['CNAMES']:
-                self._container_public_uri = CUMULUS['CNAMES'][self._container_public_uri]
-            return self._container_public_uri
-        except cloudfiles.errors.CDNNotEnabled:
-            # swift don't implements those methods yet
-            return self.swift_url + self.container_name 
+       return settings.STATICFILES_URL.replace("/static/","")
 
     container_url = property(_get_container_url)
 
     def _get_cloud_obj(self, name):
         """
-        Helper function to get retrieve the requested Cloud Files Object.
+        Helper function to retrieve the requested Cloud Files Object.
         """
-        return self.container.get_object(name)
+        if hasattr(self, 'is_static') and not name.startswith('static'):
+            name  = 'static/' + name
+        elif not hasattr(self, 'is_static') and not name.startswith('media'):
+            name  = 'media/' + name
+        tries = 0
+        while True:
+            try:
+                tries += 1
+                return self.container.get_object(name)
+            except (HTTPException, SSLError, ResponseError), e:
+                if tries >= self.max_retries:
+                    raise
+                logger.warning('Failed to retrieve %s: %r (attempt %d/%d)' % (
+                    name, e, tries, self.max_retries))
+                # re-init the connection before retrying
+                self.connection.http_connect()
 
     def _open(self, name, mode='rb'):
         """
         Return the CloudFilesStorageFile.
         """
+        if hasattr(self, 'is_static') and not name.startswith('static'):
+            name  = 'static/' + name
+        elif not hasattr(self, 'is_static') and not name.startswith('media'):
+            name  = 'media/' + name
         return CloudFilesStorageFile(storage=self, name=name)
 
     def _save(self, name, content):
@@ -136,12 +163,21 @@ class CloudFilesStorage(Storage):
         Use the Cloud Files service to write ``content`` to a remote file
         (called ``name``).
         """
+        if hasattr(self, 'is_static') and not name.startswith('static'):
+            name  = 'static/' + name
+        elif not hasattr(self, 'is_static') and not name.startswith('media'):
+            name  = 'media/' + name
+
+        print name
+        (path, last) = os.path.split(name)
+        if path:
+            try:
+                self._get_cloud_obj(path)
+            except NoSuchObject:
+                self._save(path, CloudStorageDirectory(path))
+
         content.open()
         cloud_obj = self.container.create_object(name)
-        if hasattr(content.file, 'size'):
-            cloud_obj.size = content.file.size
-        else:
-            cloud_obj.size = content.size
         # If the content type is available, pass it in directly rather than
         # getting the cloud object to try to guess.
         if hasattr(content.file, 'content_type'):
@@ -151,27 +187,71 @@ class CloudFilesStorage(Storage):
         else:
             mime_type, encoding = mimetypes.guess_type(name)
             cloud_obj.content_type = mime_type
-        cloud_obj.send(content)
-        content.close()
+        # gzip the file if its of the right content type
+        if cloud_obj.content_type in CUMULUS.get('GZIP_CONTENT_TYPES', []):
+            if hasattr(cloud_obj, 'headers'):
+                content = get_gzipped_contents(content)
+                cloud_obj.headers['Content-Encoding'] = 'gzip'
+            else:
+                print('Warning: will not compress any files due to missing'
+                      ' custom header support. Please use latest version of'
+                      ' python-cloudfiles.')
+        # set file size
+        if hasattr(content.file, 'size'):
+            cloud_obj.size = content.file.size
+        else:
+            cloud_obj.size = content.size
+        # try sending the file <max_retries> tries
+        tries = 0
+        while True:
+            try:
+                tries += 1
+                cloud_obj.send(content)
+                content.close()
+                break
+            except (HTTPException, SSLError, ResponseError), e:
+                if tries >= self.max_retries:
+                    raise
+                logger.warning('Failed to send %s: %r (attempt %d/%d)' % (
+                    name, e, tries, self.max_retries))
+                # re-init the content and connection before retrying
+                if hasattr(content, 'seek'):
+                    content.seek(0)
+                self.connection.http_connect()
+        # if it went through, apply the custom headers
+        sync_headers(cloud_obj)
         return name
 
     def delete(self, name):
         """
         Deletes the specified file from the storage system.
         """
-        try:
-            self.container.delete_object(name)
-        except ResponseError, exc:
-            if exc.status == 404:
-                pass
-            else:
-                raise
+        # try deleting the file <max_retries> tries
+        tries = 0
+        while True:
+            try:
+                tries += 1
+                self.container.delete_object(name)
+                break
+            except (HTTPException, SSLError, ResponseError), e:
+                if getattr(e, 'status', None) == 404:
+                    break
+                if tries >= self.max_retries:
+                    raise
+                logger.warning('Failed to delete %s: %r (attempt %d/%d)' % (
+                    name, e, tries, self.max_retries))
+                # re-init the connection before retrying
+                self.connection.http_connect()
 
     def exists(self, name):
         """
         Returns True if a file referenced by the given name already exists in
         the storage system, or False if the name is available for a new file.
         """
+        if hasattr(self, 'is_static') and not name.startswith('static'):
+            name  = 'static/' + name
+        elif not hasattr(self, 'is_static') and not name.startswith('media'):
+            name  = 'media/' + name
         try:
             self._get_cloud_obj(name)
             return True
@@ -186,6 +266,10 @@ class CloudFilesStorage(Storage):
 
         If the list of directories is required, use the full_listdir method.
         """
+        if hasattr(self, 'is_static') and not path.startswith('static'):
+            path  = 'static/' + path
+        elif not hasattr(self, 'is_static') and not path.startswith('media'):
+            path  = 'media/' + path
         files = []
         if path and not path.endswith('/'):
             path = '%s/' % path
@@ -203,6 +287,10 @@ class CloudFilesStorage(Storage):
         because every single object must be returned (cloudfiles does not
         provide an explicit way of listing directories).
         """
+        if hasattr(self, 'is_static') and not path.startswith('static'):
+            path  = 'static/' + path
+        elif not hasattr(self, 'is_static') and not path.startswith('media'):
+            path  = 'media/' + path
         dirs = set()
         files = []
         if path and not path.endswith('/'):
@@ -223,6 +311,10 @@ class CloudFilesStorage(Storage):
         """
         Returns the total size, in bytes, of the file specified by name.
         """
+        if hasattr(self, 'is_static') and not name.startswith('static'):
+            name  = 'static/' + name
+        elif not hasattr(self, 'is_static') and not name.startswith('media'):
+            name  = 'media/' + name
         return self._get_cloud_obj(name).size
 
     def url(self, name):
@@ -230,7 +322,76 @@ class CloudFilesStorage(Storage):
         Returns an absolute URL where the file's contents can be accessed
         directly by a web browser.
         """
+        if hasattr(self, 'is_static') and not name.startswith('static'):
+            name  = 'static/' + name
+        elif not hasattr(self, 'is_static') and not name.startswith('media'):
+            name  = 'media/' + name
         return '%s/%s' % (self.container_url, name)
+
+    def modified_time(self, name):
+        # CloudFiles return modified date in different formats
+        # depending on whether or not we pre-loaded objects.
+        # When pre-loaded, timezone is not included but we
+        # assume UTC. Since FileStorage returns localtime, and
+        # collectstatic compares these dates, we need to depend 
+        # on dateutil to help us convert timezones.
+        if hasattr(self, 'is_static') and not name.startswith('static'):
+            name  = 'static/' + name
+        elif not hasattr(self, 'is_static') and not name.startswith('media'):
+            name  = 'media/' + name
+        try:
+            from dateutil import parser, tz
+        except ImportError:
+            raise NotImplementedError()
+        obj = self._get_cloud_obj(name)
+        # convert to string to date
+        date = parser.parse(obj.last_modified)
+        # if the date has no timzone, assume UTC
+        if date.tzinfo == None:
+            date = date.replace(tzinfo=tz.tzutc())
+        # convert date to local time w/o timezone
+        date = date.astimezone(tz.tzlocal()).replace(tzinfo=None)
+        return date
+
+
+class CloudStorageDirectory(File):
+    """
+    A File-like object that creates a directory at cloudfiles
+    """
+
+    def __init__(self, name):
+        super(CloudStorageDirectory, self).__init__(StringIO(), name=name)
+        self.file.content_type = 'application/directory'
+        self.size = 0
+
+    def __str__(self):
+        return 'directory'
+
+    def __nonzero__(self):
+        return True
+
+    def open(self, mode=None):
+        self.seek(0)
+
+    def close(self):
+        pass
+
+
+class CloudFilesStaticStorage(CloudFilesStorage):
+    """
+    Subclasses CloudFilesStorage to automatically set the container to the one
+    specified in CUMULUS['STATIC_CONTAINER']. This provides the ability to
+    specify a separate storage backend for Django's collectstatic command.
+
+    To use, make sure CUMULUS['STATIC_CONTAINER'] is set to something other
+    than CUMULUS['CONTAINER']. Then, tell Django's staticfiles app by setting
+    STATICFILES_STORAGE = 'cumulus.storage.CloudFilesStaticStorage'.
+    """
+    def __init__(self, *args, **kwargs):
+        self.is_static = True
+        if not 'container' in kwargs:
+            kwargs['container'] = CUMULUS['STATIC_CONTAINER']
+        super(CloudFilesStaticStorage, self).__init__(*args, **kwargs)
 
 
 class CloudFilesStorageFile(File):
@@ -271,6 +432,10 @@ class CloudFilesStorageFile(File):
     file = property(_get_file, _set_file)
 
     def read(self, num_bytes=None):
+        if self._pos == self._get_size():
+            return ""
+        if num_bytes and self._pos + num_bytes > self._get_size():
+            num_bytes = self._get_size() - self._pos
         data = self.file.read(size=num_bytes or -1, offset=self._pos)
         self._pos += len(data)
         return data
@@ -290,6 +455,7 @@ class CloudFilesStorageFile(File):
 
     def seek(self, pos):
         self._pos = pos
+
 
 class ThreadSafeCloudFilesStorage(CloudFilesStorage):
     """
@@ -325,3 +491,17 @@ class ThreadSafeCloudFilesStorage(CloudFilesStorage):
         return self.local_cache.container
 
     container = property(_get_container, CloudFilesStorage._set_container)
+
+
+from django.core.files.storage import get_storage_class
+
+class CachedCloudFilesStaticStorage(CloudFilesStaticStorage):
+    def __init__(self, *args, **kwargs):
+        super(CachedCloudFilesStaticStorage, self).__init__(*args, **kwargs)
+        self.local_storage = get_storage_class(
+            "cumulus.storage.CloudFilesStaticStorage")()
+
+    def save(self, name, content):
+        name = super(CachedCloudFilesStaticStorage, self).save(name, content)
+        self.local_storage._save(name, content)
+        return name

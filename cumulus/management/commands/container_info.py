@@ -39,7 +39,7 @@ class Command(BaseCommand):
                 'name': container.name,
                 'count': container.object_count,
                 'size': container.size_used,
-                'uri': container.public_uri() if container.is_public() else "NOT PUBLIC",
+                'uri': container.public_uri(),
             }
             output = [str(info[o]) for o in opts if options.get(o)]
             if not output:
