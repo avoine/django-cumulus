@@ -498,7 +498,7 @@ class CachedCloudFilesStaticStorage(CloudFilesStaticStorage):
     def __init__(self, *args, **kwargs):
         super(CachedCloudFilesStaticStorage, self).__init__(*args, **kwargs)
         self.local_storage = get_storage_class(
-            "cumulus.storage.CloudFilesStaticStorage")()
+            "compressor.storage.CompressorFileStorage")()
 
     def save(self, name, content):
         name = super(CachedCloudFilesStaticStorage, self).save(name, content)
