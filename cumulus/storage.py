@@ -168,7 +168,6 @@ class CloudFilesStorage(Storage):
         elif not hasattr(self, 'is_static') and not name.startswith('media'):
             name  = 'media/' + name
 
-        print name
         (path, last) = os.path.split(name)
         if path:
             try:
